@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>AR.js — Nav + Draw Demo (Hiro)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+
+  <!-- A-Frame + AR.js + meshline (CDNs) -->
+  <script src="https://aframe.io/releases/1.4.1/aframe.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/AR-js-org/AR.js/aframe/build/aframe-ar.js"></script>
+  <script src="https://unpkg.com/aframe-meshline-component/dist/aframe-meshline-component.min.js"></script>
+
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    /* UI overlay */
+    .ui {
+      position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
+      display: flex; gap: 8px; flex-wrap: wrap; align-items: center; justify-content: center;
+      background: rgba(0,0,0,0.5); padding: 10px 12px; border-radius: 12px; z-index: 10;
+      color: #fff; backdrop-filter: blur(6px);
+      user-select: none;
+    }
+    .ui button {
+      border: 0; padding: 8px 12px; border-radius: 10px; font-weight: 600; cursor: pointer;
+    }
+    .ui .mode { background: #ffd54f; }
+    .ui .navbtn { background: #90caf9; }
+    .ui .clear { background: #ff8a80; }
+    .ui .help { background: #a5d6a7; }
+    .hint {
+      position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%);
+      background: rgba(0,0,0,0.5); color: #fff; padding: 8px 12px; border-radius: 10px; font-size: 14px; z-index: 10;
+    }
+    a { color: #ffd54f; }
+  </style>
+</head>
+<body>
+  <!-- UI Overlay -->
+  <div class="ui">
+    <button class="mode" id="modeBtn">Mode: Nav</button>
+    <button class="navbtn" data-dir="north">North</button>
+    <button class="navbtn" data-dir="east">East</button>
+    <button class="navbtn" data-dir="south">South</button>
+    <button class="navbtn" data-dir="west">West</button>
+    <button class="clear" id="clearBtn" title="Clear drawings / reset">Clear</button>
+    <button class="help" id="helpBtn" title="Show instructions">Help</button>
+  </div>
+  <div class="hint">Allow camera access • Point to a printed (or on-screen) <b>Hiro</b> marker</div>
+
+  <!-- AR Scene -->
+  <a-scene
+    embedded
+    vr-mode-ui="enabled: false"
+    renderer="antialias: true; colorManagement: true"
+    arjs="sourceType: webcam; debugUIEnabled: false; trackingMethod: best;">
+
+    <!-- Marker anchor (HIRO) -->
+    <a-marker id="marker" preset="hiro">
+      <!-- Flat plane on top of marker for nav & drawing (1m x 1m) -->
+      <a-plane class="draw-surface"
+               position="0 0 0" rotation="-90 0 0"
+               width="1.2" height="1.2"
+               color="#4CC3D9" opacity="0.18">
+      </a-plane>
+
+      <!-- Cardinal labels (tiny) -->
+      <a-text value="N" position="0 0.01 -0.62" rotation="-90 0 0" align="center" width="1.5" color="#ffffff"></a-text>
+      <a-text value="S" position="0 0.01 0.62" rotation="-90 0 0" align="center" width="1.5" color="#ffffff"></a-text>
+      <a-text value="E" position="0.62 0.01 0" rotation="-90 0 0" align="center" width="1.5" color="#ffffff"></a-text>
+      <a-text value="W" position="-0.62 0.01 0" rotation="-90 0 0" align="center" width="1.5" color="#ffffff"></a-text>
+
+      <!-- Navigation group (arrow + target + path + readout) -->
+      <a-entity id="navRoot">
+        <!-- Arrow rig: yaw this entity around Y; inside, the arrow model points along -Z -->
+        <a-entity id="arrowRig" position="0 0.05 0" rotation="0 0 0">
+          <a-entity rotation="90 0 0">
+            <a-cylinder height="0.20" radius="0.02" position="0 0.10 0" color="#FFC107"></a-cylinder>
+            <a-cone height="0.20" radius-bottom="0.06" position="0 0.28 0" color="#FFC107"></a-cone>
+          </a-entity>
+        </a-entity>
+
+        <!-- Target box (initial at North) -->
+        <a-box id="target" position="0 0 -0.6" depth="0.05" height="0.05" width="0.05" color="#E91E63"></a-box>
+
+        <!-- Path line -->
+        <a-entity id="path" meshline="lineWidth: 8"></a-entity>
+
+        <!-- Distance readout (on plane) -->
+        <a-entity id="distanceLabel" text="value: ; align: center; width: 2.5; color: #fff;"
+                  position="0 0.01 -0.15" rotation="-90 0 0"></a-entity>
+      </a-entity>
+
+      <!-- Drawing container -->
+      <a-entity id="drawing"></a-entity>
+    </a-marker>
+
+    <!-- Camera & cursor for raycasting to the plane (works with mouse/touch) -->
+    <a-entity camera></a-entity>
+    <a-entity id="cursor" cursor="rayOrigin: mouse" raycaster="objects: .draw-surface"></a-entity>
+  </a-scene>
+
+  <script>
+    // --- Helpers ---
+    const markerEl = document.getElementById('marker');
+    const arrowRig = document.getElementById('arrowRig');
+    const targetEl = document.getElementById('target');
+    const pathEl = document.getElementById('path');
+    const distanceLabel = document.getElementById('distanceLabel');
+    const drawingEl = document.getElementById('drawing');
+    const modeBtn = document.getElementById('modeBtn');
+    const clearBtn = document.getElementById('clearBtn');
+    const helpBtn = document.getElementById('helpBtn');
+
+    let mode = 'nav'; // 'nav' | 'draw'
+    let lastDrawPoint = null; // THREE.Vector3 (in marker-local space)
+
+    const DIRS = {
+      north: new THREE.Vector3(0, 0, -0.6),
+      east:  new THREE.Vector3(0.6, 0, 0),
+      south: new THREE.Vector3(0, 0, 0.6),
+      west:  new THREE.Vector3(-0.6, 0, 0)
+    };
+
+    function setMode(next) {
+      mode = next;
+      modeBtn.textContent = `Mode: ${mode === 'nav' ? 'Nav' : 'Draw'}`;
+      document.querySelectorAll('.navbtn').forEach(b => b.disabled = (mode !== 'nav'));
+    }
+
+    function setTarget(vec3) {
+      targetEl.object3D.position.copy(vec3);
+      // Yaw so arrow faces target (arrow forward is -Z in marker-local)
+      const dx = vec3.x, dz = vec3.z;
+      const yawDeg = THREE.MathUtils.radToDeg(Math.atan2(dx, -dz));
+      arrowRig.setAttribute('rotation', `0 ${yawDeg.toFixed(2)} 0`);
+      // Update path (slightly above plane to avoid z-fighting)
+      const path = `0 0.01 0, ${vec3.x} 0.01 ${vec3.z}`;
+      pathEl.setAttribute('meshline', { path, lineWidth: 8 });
+      // Distance label
+      const dist = Math.sqrt(dx*dx + dz*dz);
+      distanceLabel.setAttribute('text', 'value', `Heading: ${yawDeg.toFixed(0)}°  |  Distance: ${dist.toFixed(2)} m`);
+      // Bling when "arrived"
+      if (dist < 0.12) {
+        targetEl.setAttribute('color', '#00E676'); // green
+        targetEl.setAttribute('animation__pulse', 'property: scale; to: 0.12 0.12 0.12; dir: alternate; dur: 400; loop: 4; easing: easeInOutSine');
+      } else {
+        targetEl.setAttribute('color', '#E91E63');
+        targetEl.removeAttribute('animation__pulse');
+      }
+    }
+
+    // Hook up direction buttons
+    document.querySelectorAll('.navbtn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        setTarget(DIRS[btn.dataset.dir].clone());
+      });
+    });
+
+    // Toggle mode
+    modeBtn.addEventListener('click', () => {
+      setMode(mode === 'nav' ? 'draw' : 'nav');
+    });
+
+    // Clear drawings and reset
+    clearBtn.addEventListener('click', () => {
+      drawingEl.innerHTML = '';
+      lastDrawPoint = null;
+      setTarget(DIRS.north.clone());
+    });
+
+    // Help
+    helpBtn.addEventListener('click', () => {
+      alert(
+`HOW TO DEMO:
+1) Allow camera. Show the Hiro marker (print it or open on another screen).
+2) In Nav mode: tap North/East/South/West. Arrow rotates, path draws, distance updates.
+3) Switch to Draw mode: tap on the marker's plane to drop dots. Lines auto-connect.
+4) Press Clear to reset.
+
+Tips:
+• Good lighting & keep the whole marker in view.
+• Use HTTPS (GitHub Pages) on mobile so camera works.`
+      );
+    });
+
+    // Handle drawing: click on plane -> add dot & segment (marker-local coords)
+    const plane = document.querySelector('.draw-surface');
+    plane.addEventListener('click', (ev) => {
+      if (mode !== 'draw') return;
+      const inter = ev.detail && ev.detail.intersection;
+      if (!inter || !inter.point) return;
+
+      const worldPoint = inter.point.clone();
+      const localPoint = worldPoint.clone();
+      markerEl.object3D.worldToLocal(localPoint);
+
+      // dot
+      const dot = document.createElement('a-sphere');
+      dot.setAttribute('radius', 0.01);
+      dot.setAttribute('color', '#FFD740');
+      dot.object3D.position.copy(localPoint);
+      drawingEl.appendChild(dot);
+
+      // line to last point
+      if (lastDrawPoint) {
+        const seg = document.createElement('a-entity');
+        const path = `${lastDrawPoint.x} ${lastDrawPoint.y+0.005} ${lastDrawPoint.z}, ${localPoint.x} ${localPoint.y+0.005} ${localPoint.z}`;
+        seg.setAttribute('meshline', { path, lineWidth: 6 });
+        drawingEl.appendChild(seg);
+      }
+      lastDrawPoint = localPoint.clone();
+    });
+
+    // Initialize
+    setMode('nav');
+    setTarget(DIRS.north.clone());
+  </script>
+</body>
+</html>
